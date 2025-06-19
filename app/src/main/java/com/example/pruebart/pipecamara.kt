@@ -1,13 +1,10 @@
 package com.example.pruebart
-/*
+
 import android.Manifest
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.graphics.YuvImage
+import android.graphics.*
 import android.util.Log
+import android.view.View
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -31,13 +28,97 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.sqrt
 
-// Clase HandDetector
+// Vista personalizada para dibujar solo los puntos (sin conexiones)
+class HandLandmarksOverlay(context: Context) : View(context) {
+    private var handLandmarks: List<List<NormalizedLandmark>> = emptyList()
+    private var viewWidth = 0
+    private var viewHeight = 0
+    private var imageWidth = 0
+    private var imageHeight = 0
+    private var isFrontCamera = true
+
+    private val pointPaint = Paint().apply {
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+
+    private val textPaint = Paint().apply {
+        color = Color.WHITE
+        textSize = 24f
+        textAlign = Paint.Align.CENTER
+        setShadowLayer(4f, 2f, 2f, Color.BLACK)
+    }
+
+    fun updateLandmarks(
+        landmarks: List<List<NormalizedLandmark>>,
+        imageWidth: Int,
+        imageHeight: Int,
+        isFrontCamera: Boolean = true
+    ) {
+        this.handLandmarks = landmarks
+        this.imageWidth = imageWidth
+        this.imageHeight = imageHeight
+        this.isFrontCamera = isFrontCamera
+        invalidate() // Redibuja la vista
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        viewWidth = w
+        viewHeight = h
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+
+        if (viewWidth == 0 || viewHeight == 0 || imageWidth == 0 || imageHeight == 0) return
+
+        // Dibujar landmarks para cada mano detectada
+        handLandmarks.forEach { landmarks ->
+            drawHandPoints(canvas, landmarks)
+        }
+    }
+
+    private fun drawHandPoints(canvas: Canvas, landmarks: List<NormalizedLandmark>) {
+        landmarks.forEachIndexed { index, landmark ->
+            // Transformar coordenadas considerando la rotación y el espejo de la cámara frontal
+            var x = landmark.x()
+            var y = landmark.y()
+
+            // Para cámara frontal: rotar 180 grados y hacer espejo
+            if (isFrontCamera) {
+                // Rotar 180 grados: invertir tanto X como Y
+                x = 1.0f - x
+                y = 1.0f - y
+            }
+
+            // Escalar a las dimensiones de la vista
+            val screenX = x * viewWidth
+            val screenY = y * viewHeight
+
+            // Cambiar color según el tipo de punto
+            when (index) {
+                0 -> pointPaint.color = Color.BLUE // Muñeca
+                4, 8, 12, 16, 20 -> pointPaint.color = Color.YELLOW // Puntas de dedos
+                else -> pointPaint.color = Color.RED // Otros puntos
+            }
+
+            // Dibujar punto más grande y visible
+            canvas.drawCircle(screenX, screenY, 12f, pointPaint)
+
+            // Dibujar número del punto con sombra para mejor visibilidad
+            canvas.drawText(index.toString(), screenX, screenY + 6, textPaint)
+        }
+    }
+}
+
+// Clase HandDetector (sin cambios significativos)
 class HandDetector(private val context: Context) {
 
     private var handLandmarker: HandLandmarker? = null
@@ -50,7 +131,7 @@ class HandDetector(private val context: Context) {
     private val maxNumHands = 2
 
     // Callbacks
-    var onHandsDetected: ((HandLandmarkerResult) -> Unit)? = null
+    var onHandsDetected: ((HandLandmarkerResult, Int, Int) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
 
     fun initialize(): Boolean {
@@ -102,7 +183,7 @@ class HandDetector(private val context: Context) {
         input: MPImage
     ) {
         Log.d("HandDetector", "Manos detectadas: ${result.landmarks().size}")
-        onHandsDetected?.invoke(result)
+        onHandsDetected?.invoke(result, input.width, input.height)
     }
 
     private fun handleError(error: RuntimeException) {
@@ -126,7 +207,7 @@ class HandDetector(private val context: Context) {
         const val PINKY_TIP = 20
 
         // Función para contar dedos extendidos
-        fun countExtendedFingers(landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>): Int {
+        fun countExtendedFingers(landmarks: List<NormalizedLandmark>): Int {
             var count = 0
 
             // Pulgar (verificar si está extendido comparando con el punto anterior)
@@ -143,8 +224,8 @@ class HandDetector(private val context: Context) {
 
         // Calcular distancia entre dos puntos
         fun calculateDistance(
-            point1: com.google.mediapipe.tasks.components.containers.NormalizedLandmark,
-            point2: com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+            point1: NormalizedLandmark,
+            point2: NormalizedLandmark
         ): Float {
             val dx = point1.x() - point2.x()
             val dy = point1.y() - point2.y()
@@ -165,6 +246,8 @@ fun pipe() {
     var handDetectionInfo by remember { mutableStateOf("Iniciando detector...") }
     var fingerCount by remember { mutableStateOf(0) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var landmarks by remember { mutableStateOf<List<List<NormalizedLandmark>>>(emptyList()) }
+    var imageSize by remember { mutableStateOf(Pair(0, 0)) }
 
     // Detector y executor
     val handDetector = remember { HandDetector(context) }
@@ -172,13 +255,16 @@ fun pipe() {
 
     // Configurar detector
     LaunchedEffect(Unit) {
-        handDetector.onHandsDetected = { result ->
+        handDetector.onHandsDetected = { result, width, height ->
+            imageSize = Pair(width, height)
             if (result.landmarks().isNotEmpty()) {
-                val landmarks = result.landmarks()[0]
-                val count = HandDetector.countExtendedFingers(landmarks)
+                landmarks = result.landmarks()
+                val firstHandLandmarks = result.landmarks()[0]
+                val count = HandDetector.countExtendedFingers(firstHandLandmarks)
                 fingerCount = count
                 handDetectionInfo = "Manos detectadas: ${result.landmarks().size}, Dedos: $count"
             } else {
+                landmarks = emptyList()
                 handDetectionInfo = "No se detectaron manos"
                 fingerCount = 0
             }
@@ -237,16 +323,36 @@ fun pipe() {
             }
         }
 
-        // Vista de cámara
+        // Vista de cámara con overlay
         if (cameraPermissionState.status.isGranted) {
-            CameraPreviewComposable(
-                handDetector = handDetector,
-                lifecycleOwner = lifecycleOwner,
-                cameraExecutor = cameraExecutor,
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-            )
+            ) {
+                CameraPreviewComposable(
+                    handDetector = handDetector,
+                    lifecycleOwner = lifecycleOwner,
+                    cameraExecutor = cameraExecutor,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                // Overlay para mostrar solo los puntos
+                AndroidView(
+                    factory = { ctx ->
+                        HandLandmarksOverlay(ctx)
+                    },
+                    update = { overlay ->
+                        overlay.updateLandmarks(
+                            landmarks,
+                            imageSize.first,
+                            imageSize.second,
+                            isFrontCamera = true
+                        )
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
         } else {
             // Solicitar permisos
             Column(
@@ -279,14 +385,18 @@ fun CameraPreviewComposable(
     AndroidView(
         factory = { ctx ->
             val previewView = PreviewView(ctx)
+            previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
+
             val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
 
             cameraProviderFuture.addListener({
                 val cameraProvider = cameraProviderFuture.get()
 
-                val preview = Preview.Builder().build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
-                }
+                val preview = Preview.Builder()
+                    .build()
+                    .also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
+                    }
 
                 val imageAnalyzer = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -347,4 +457,4 @@ private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
     yuvImage.compressToJpeg(Rect(0, 0, yuvImage.width, yuvImage.height), 50, out)
     val imageBytes = out.toByteArray()
     return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-}*/
+}
